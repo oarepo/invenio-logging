@@ -6,11 +6,12 @@
 
 from __future__ import absolute_import, print_function
 
+import gzip
 import time
 from unittest.mock import patch
 
 import sentry_sdk
-from flask import Flask
+from flask import Flask, g
 from sentry_sdk.integrations.celery import CeleryIntegration
 from sentry_sdk.integrations.flask import FlaskIntegration
 
@@ -110,3 +111,31 @@ def test_legacy_store_transport_drops_non_event_items():
     with patch.object(transport, "_send_request") as mock_send_request:
         transport._send_envelope(env)
         mock_send_request.assert_not_called()
+
+
+def test_request_id_tag_delivered_with_existing_tags():
+    """Tagged events are delivered and get a request_id tag.
+
+    Regression: before_send appended to event["tags"], which sentry-sdk 2.x
+    represents as a dict once any tag is set. Appending to it raised inside
+    before_send, so the event was silently dropped.
+    """
+    app = Flask("testapp")
+    app.config["SENTRY_DSN"] = "http://user:pw@localhost/0"
+    InvenioLoggingSentry(app)
+
+    transport = sentry_sdk.get_global_scope().client.transport
+    with patch.object(transport, "_send_request") as mock_send_request:
+        with app.test_request_context("/"):
+            g.request_id = "req-123"
+            sentry_sdk.set_tag("existing", "value")  # makes event["tags"] a dict
+            try:
+                1 / 0
+            except ZeroDivisionError:
+                app.logger.exception("boom")
+        time.sleep(2)
+        # Delivered rather than dropped by before_send.
+        mock_send_request.assert_called()
+        payload = gzip.decompress(mock_send_request.call_args.args[0]).decode()
+        assert '"request_id":"req-123"' in payload
+        assert '"existing":"value"' in payload
