@@ -14,7 +14,7 @@ from flask import Flask
 from sentry_sdk.integrations.celery import CeleryIntegration
 from sentry_sdk.integrations.flask import FlaskIntegration
 
-from invenio_logging.sentry import InvenioLoggingSentry
+from invenio_logging.sentry import InvenioLoggingSentry, LegacyStoreTransport
 
 
 def test_init():
@@ -59,3 +59,54 @@ def test_sentry_failure():
         mock_send_request.assert_called()
 
     assert sentry_sdk.last_event_id() is not None
+
+
+def test_legacy_store_transport_hits_store_endpoint():
+    """LegacyStoreTransport sends events to the /store/ endpoint."""
+    app = Flask("testapp")
+    app.config["SENTRY_DSN"] = "http://user:pw@localhost/0"
+    app.config["LOGGING_SENTRY_INIT_KWARGS"] = {"transport": LegacyStoreTransport}
+    InvenioLoggingSentry(app)
+
+    transport = sentry_sdk.get_global_scope().client.transport
+    assert isinstance(transport, LegacyStoreTransport)
+
+    with patch.object(transport, "_send_request") as mock_send_request:
+        # An app context is needed because before_send writes g.sentry_event_id.
+        with app.app_context():
+            try:
+                1 / 0
+            except ZeroDivisionError:
+                app.logger.exception("boom")
+        time.sleep(2)
+        mock_send_request.assert_called()
+        endpoint = mock_send_request.call_args.kwargs["endpoint_type"]
+        # resolves to the legacy /store/ URL
+        assert getattr(endpoint, "value", endpoint) == "store"
+
+
+def test_default_transport_is_not_legacy_store():
+    """Without opting in, the standard envelope transport is used."""
+    app = Flask("testapp")
+    app.config["SENTRY_DSN"] = "http://user:pw@localhost/0"
+    InvenioLoggingSentry(app)
+
+    transport = sentry_sdk.get_global_scope().client.transport
+    assert not isinstance(transport, LegacyStoreTransport)
+
+
+def test_legacy_store_transport_drops_non_event_items():
+    """Only `event` items are forwarded; sessions/etc. are dropped."""
+    from sentry_sdk.envelope import Envelope
+
+    app = Flask("testapp")
+    app.config["SENTRY_DSN"] = "http://user:pw@localhost/0"
+    app.config["LOGGING_SENTRY_INIT_KWARGS"] = {"transport": LegacyStoreTransport}
+    InvenioLoggingSentry(app)
+
+    transport = sentry_sdk.get_global_scope().client.transport
+    env = Envelope()
+    env.add_session({"sid": "x", "status": "ok"})  # a non-event item
+    with patch.object(transport, "_send_request") as mock_send_request:
+        transport._send_envelope(env)
+        mock_send_request.assert_not_called()

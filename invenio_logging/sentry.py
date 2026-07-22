@@ -5,7 +5,10 @@
 
 from __future__ import absolute_import, print_function
 
+import gzip
+import io
 import logging
+from types import SimpleNamespace
 
 from flask import g
 
@@ -14,8 +17,10 @@ from .ext import InvenioLoggingBase
 
 try:
     import sentry_sdk
+    from sentry_sdk.transport import HttpTransport
 except ImportError:
     sentry_sdk = None
+    HttpTransport = object
 
 
 class InvenioLoggingSentry(InvenioLoggingBase):
@@ -120,3 +125,44 @@ class InvenioLoggingSentry(InvenioLoggingBase):
         if event_id is not None:
             g.sentry_event_id = event_id
         return event
+
+
+class LegacyStoreTransport(HttpTransport):
+    """Route Sentry error events to the legacy ``/store/`` endpoint.
+
+    sentry-sdk 2.x sends only envelopes, which pre-envelope Sentry servers
+    (e.g. Sentry 9.x) reject, so every event is silently dropped. This transport
+    posts events to the ``/store/`` endpoint those servers understand.
+
+    Enable it in ``invenio.cfg``::
+
+        from invenio_logging.sentry import LegacyStoreTransport
+
+        LOGGING_SENTRY_INIT_KWARGS = {"transport": LegacyStoreTransport}
+    """
+
+    # sentry-sdk 2.x's EndpointType enum dropped "store", but Auth.get_api_url()
+    # still builds the URL from <endpoint>.value, so this marker resolves to the
+    # legacy /store/ URL when passed to _send_request().
+    _STORE_ENDPOINT = SimpleNamespace(value="store")
+
+    def _send_envelope(self, envelope):
+        """Forward error events in the envelope to the legacy store endpoint."""
+        for item in envelope.items:
+            if item.type != "event":
+                continue
+            # Gzip the event and POST it as application/json, as sentry-sdk 1.x's
+            # HttpTransport._send_event did (the last version to speak /store/):
+            # https://github.com/getsentry/sentry-python/blob/282b8f7fae3da3c3ec26e5ee5e1599fc74661a72/sentry_sdk/transport.py#L376-L414
+            body = io.BytesIO()
+            with gzip.GzipFile(fileobj=body, mode="w") as fp:
+                fp.write(item.get_bytes())
+            self._send_request(
+                body.getvalue(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Encoding": "gzip",
+                },
+                endpoint_type=self._STORE_ENDPOINT,
+                envelope=envelope,
+            )
