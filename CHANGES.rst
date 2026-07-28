@@ -7,6 +7,11 @@
 Changes
 =======
 
+Version v4.3.1 (released 2026-07-28)
+
+- fix(sentry): set request_id tag as dict, not list
+- feat(sentry): LegacyStoreTransport for pre-envelope Sentry servers
+
 Version v4.3.0 (released 2026-07-16)
 
 - chore(setup): migrate from setuptools to hatchling
